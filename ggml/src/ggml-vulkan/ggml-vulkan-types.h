@@ -938,6 +938,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_topk_radix_qsa; // qwen4 QSA indexer fusion (f16 mask)
     vk_pipeline pipeline_qsa_block_attn[9];   // [vk-qsa-blk] indexed by query heads per kv head
     vk_pipeline pipeline_qsa_block_combine;
+    vk_pipeline pipeline_qsa_score_reduce;   // [qsa-score-reduce]
     vk_pipeline pipeline_qsa_stream_resolve; // [kv-stream]
     vk_pipeline pipeline_qsa_stream_copy;
     vk_pipeline pipeline_sum_rows_f32;

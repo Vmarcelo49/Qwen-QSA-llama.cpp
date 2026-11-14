@@ -202,6 +202,7 @@ uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
         return OC * size_N * (size_K + (size_K - 1));
     }
     if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        if (node->src[5] == nullptr && node->op_params[7] == 0x51534352) { return 0; } // [qsa-score-reduce]
         const ggml_tensor * q = node->src[0];
         const ggml_tensor * k = node->src[1];
         const ggml_tensor * v = node->src[2];
@@ -3350,6 +3351,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const uint32_t BLOCK_SIZE = 1u << std::min(10u, device->max_workgroup_size_log2);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_f32, "topk_radix_f32", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 0}, 1, true);
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
+    }
+
+    // [qsa-score-reduce] the QSA indexer's score post-processing in one pass
+    if (getenv("GGML_VK_QSA_SCORE_REDUCE_DISABLE") == nullptr) {
+        ggml_vk_create_pipeline2(device, device->pipeline_qsa_score_reduce, "qsa_score_reduce", qsa_score_reduce_len, qsa_score_reduce_data, "main", 3, sizeof(vk_op_qsa_score_reduce_push_constants), {64, 1, 1}, {}, 1, true);
     }
 
     // [vk-qsa-blk] block-sparse QSA attention: one full subgroup per (split, kv head, token)
@@ -11184,6 +11190,46 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
     ctx->prealloc_x_need_sync = true;
 }
 
+// [qsa-score-reduce] The QSA indexer's block scores after the q.k products (vulkan-shaders/qsa_score_reduce.comp).
+// The graph marks a FLASH_ATTN_EXT node with op_params[7] = GGML_VK_QSA_SCORE_REDUCE_MAGIC and no block ids:
+//   src[0] score F32 [n_blk, n_head, n_tok], src[1] vis F32 [1, n_tok] (src[2] repeats it), dst F32 [n_blk, n_tok]
+#define GGML_VK_QSA_SCORE_REDUCE_MAGIC 0x51534352
+
+bool ggml_vk_qsa_score_reduce_is(const ggml_tensor * dst) {
+    return dst->op == GGML_OP_FLASH_ATTN_EXT && dst->src[5] == nullptr && ggml_get_op_params_i32(dst, 7) == GGML_VK_QSA_SCORE_REDUCE_MAGIC;
+}
+
+bool ggml_vk_qsa_score_reduce_supported(const vk_device& device, const ggml_tensor * dst) {
+    const ggml_tensor * s = dst->src[0];
+    const ggml_tensor * v = dst->src[1];
+    return device->pipeline_qsa_score_reduce != nullptr && s && v &&
+           s->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(s) && ggml_is_contiguous(dst) && s->ne[3] == 1 &&
+           v->ne[0] == 1 && v->ne[1] == s->ne[2] && (v->nb[1] % sizeof(float)) == 0 &&
+           dst->ne[0] == s->ne[0] && dst->ne[1] == s->ne[2] && dst->ne[2] == 1 && dst->ne[3] == 1 &&
+           s->ne[2] <= 65535 && (uint64_t) ggml_nelements(s) < UINT32_MAX;
+}
+
+void ggml_vk_qsa_score_reduce(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * s = dst->src[0];
+    const ggml_tensor * v = dst->src[1];
+    GGML_ASSERT(ggml_vk_qsa_score_reduce_supported(ctx->device, dst));
+
+    vk_pipeline pipeline = ctx->device->pipeline_qsa_score_reduce;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_op_qsa_score_reduce_push_constants pc = {
+        (uint32_t) s->ne[0], (uint32_t) s->ne[1], (uint32_t) s->ne[2],
+        get_misalign_bytes(ctx, s) / (uint32_t) sizeof(float),
+        get_misalign_bytes(ctx, v) / (uint32_t) sizeof(float),
+        (uint32_t) (v->nb[1] / sizeof(float)),
+        get_misalign_bytes(ctx, dst) / (uint32_t) sizeof(float),
+    };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, s, true), ggml_vk_tensor_subbuffer(ctx, v, true), ggml_vk_tensor_subbuffer(ctx, dst, true) },
+        pc, { (uint32_t) s->ne[0], (uint32_t) s->ne[2], 1 });
+}
+
 // [vk-qsa-blk] Block-sparse QSA attention, the counterpart of ggml-cuda/qsa-attn.cu: a FLASH_ATTN_EXT node
 // with src[5] = block ids. See vulkan-shaders/qsa_block_attn.comp for the layout.
 bool ggml_vk_qsa_block_attn_is_sparse(const ggml_tensor * dst) {
@@ -12636,7 +12682,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
 
     case GGML_OP_FLASH_ATTN_EXT:
-        if (ggml_vk_qsa_block_attn_is_sparse(node)) {
+        if (ggml_vk_qsa_score_reduce_is(node)) {
+            ggml_vk_qsa_score_reduce(ctx, compute_ctx, node); // [qsa-score-reduce]
+        } else if (ggml_vk_qsa_block_attn_is_sparse(node)) {
             ggml_vk_qsa_block_attn(ctx, compute_ctx, node); // [vk-qsa-blk]
         } else {
             ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node);
@@ -15402,6 +15450,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                if (ggml_vk_qsa_score_reduce_is(op)) {
+                    return ggml_vk_qsa_score_reduce_supported(device, op); // [qsa-score-reduce]
+                }
                 if (ggml_vk_qsa_block_attn_is_sparse(op)) {
                     return ggml_vk_qsa_block_attn_supported(device, op); // [vk-qsa-blk]
                 }

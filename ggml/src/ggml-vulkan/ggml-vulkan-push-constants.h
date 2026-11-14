@@ -558,6 +558,17 @@ struct vk_op_qsa_block_attn_push_constants {
     uint32_t tok_base;
 };
 
+// [qsa-score-reduce] qsa_score_reduce.comp
+struct vk_op_qsa_score_reduce_push_constants {
+    uint32_t n_blk;
+    uint32_t n_head;
+    uint32_t n_tok;
+    uint32_t s_offset;
+    uint32_t v_offset;
+    uint32_t v_stride;
+    uint32_t d_offset;
+};
+
 // [kv-stream] qsa_stream.comp
 struct vk_op_qsa_stream_push_constants {
     uint32_t n_ids;

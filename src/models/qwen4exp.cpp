@@ -1493,30 +1493,53 @@ ggml_tensor * llm_build_qsa_base::build_qsa_blk_select(
         ggml_tensor * qc = ggml_view_2d(ctx0, q, idx_dim, n_idx_h*nt, q->nb[1], t0*q->nb[2]);
         ggml_tensor * score = ggml_mul_mat(ctx0, blk, qc);
         score = ggml_reshape_3d(ctx0, score, n_blk, n_idx_h, nt);
-        score = ggml_relu(ctx0, score);
-
+        // [qsa-score-reduce] rectify, sum the heads and add the visibility bias in one pass where the backend has the
+        // kernel (Vulkan): same arithmetic and order as the chain below. A FLASH_ATTN_EXT node marked in op_params[7].
         ggml_tensor * summed = nullptr;
-        for (int64_t h = 0; h < n_idx_h; ++h) {
-            ggml_tensor * slice = ggml_view_2d(ctx0, score, n_blk, nt, score->nb[2], h*score->nb[1]);
-            summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
-        }
-        cb(summed, "indexer_score", il);
-
-        // blocks at or past a query's tail are out of reach: 0 below vis, -1e30 from there on.
-        // it depends on the query cells only, so a single-chunk graph builds it once for all layers
-        ggml_tensor * vis_bias = nullptr;
-        if (nt == n_tokens && inp->vis_bias != nullptr && inp->vis_bias->ne[0] == n_blk) {
-            vis_bias = inp->vis_bias;
-        } else {
+        static const bool reduce_on = [] {
+            const char * env = getenv("LLAMA_QSA_SCORE_REDUCE");
+            return env == nullptr || atoi(env) != 0;
+        }();
+        if (reduce_on && strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(model.dev_layer(il))), "Vulkan") == 0) {
             ggml_tensor * vis = ggml_view_2d(ctx0, inp->vis, 1, nt, inp->vis->nb[1], t0*inp->vis->nb[1]);
-            ggml_tensor * idx = ggml_repeat_4d(ctx0, ggml_arange(ctx0, 0.0f, (float) n_blk, 1.0f), n_blk, nt, 1, 1);
-            ggml_tensor * seen = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_sub(ctx0, idx, vis), -1.0f, -0.5f));
-            vis_bias = ggml_scale_bias(ctx0, seen, 1e30f, -1e30f);
-            if (nt == n_tokens) {
-                inp->vis_bias = vis_bias;
+            ggml_tensor * red = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_blk, nt);
+            const int32_t magic = 0x51534352;
+            memcpy((char *) red->op_params + 7*sizeof(int32_t), &magic, sizeof(magic));
+            red->op     = GGML_OP_FLASH_ATTN_EXT;
+            red->src[0] = score;
+            red->src[1] = vis;
+            red->src[2] = vis;
+            if (ggml_backend_dev_supports_op(model.dev_layer(il), red)) {
+                summed = red;
+                cb(summed, "indexer_score", il);
             }
         }
-        summed = ggml_add(ctx0, summed, vis_bias);
+        if (summed == nullptr) {
+            score = ggml_relu(ctx0, score);
+
+            for (int64_t h = 0; h < n_idx_h; ++h) {
+                ggml_tensor * slice = ggml_view_2d(ctx0, score, n_blk, nt, score->nb[2], h*score->nb[1]);
+                summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+            }
+            cb(summed, "indexer_score", il);
+
+            // blocks at or past a query's tail are out of reach: 0 below vis, -1e30 from there on.
+            // it depends on the query cells only, so a single-chunk graph builds it once for all layers
+            ggml_tensor * vis_bias = nullptr;
+            if (nt == n_tokens && inp->vis_bias != nullptr && inp->vis_bias->ne[0] == n_blk) {
+                vis_bias = inp->vis_bias;
+            } else {
+                ggml_tensor * vis = ggml_view_2d(ctx0, inp->vis, 1, nt, inp->vis->nb[1], t0*inp->vis->nb[1]);
+                ggml_tensor * idx = ggml_repeat_4d(ctx0, ggml_arange(ctx0, 0.0f, (float) n_blk, 1.0f), n_blk, nt, 1, 1);
+                ggml_tensor * seen = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_sub(ctx0, idx, vis), -1.0f, -0.5f));
+                vis_bias = ggml_scale_bias(ctx0, seen, 1e30f, -1e30f);
+                if (nt == n_tokens) {
+                    inp->vis_bias = vis_bias;
+                }
+            }
+            summed = ggml_add(ctx0, summed, vis_bias);
+
+        }
 
         ggml_tensor * tc = ggml_top_k(ctx0, summed, n_sel);
         if (!ggml_is_contiguous(tc)) {
