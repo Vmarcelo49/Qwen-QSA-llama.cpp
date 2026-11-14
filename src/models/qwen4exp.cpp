@@ -1940,6 +1940,13 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
             out->src[2] = v3;
             out->src[3] = selected_mask;
             out->src[5] = ids;
+            const llama_kv_cache * kv_stream = mctx_cur->get_kv(); // [kv-stream]
+            if (kv_stream && kv_stream->stream_enabled()) {
+                // the ids are rewritten between the selection and this node (llama_kv_cache::stream_translate)
+                ggml_format_name(ids, "qsa_stream_ids-%d", il);
+                out->src[6] = kv_stream->stream_scratch_k();
+                out->src[7] = kv_stream->stream_scratch_v();
+            }
             if (ggml_backend_dev_supports_op(model.dev_layer(il), out)) {
                 cb(out, "kqv_out", il);
                 ggml_tensor * cur = ggml_reshape_2d(ctx0, out, 256*q->ne[1], n_tok);
@@ -1948,6 +1955,9 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
                 }
                 return cur;
             }
+            if (kv_stream && kv_stream->stream_enabled()) {
+                GGML_ABORT("[kv-stream] this device or K/V cache type has no block-sparse QSA kernel");
+            }
             static bool warned = false;
             if (!warned) {
                 warned = true;
@@ -1955,6 +1965,10 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
                         "using the slow gather path\n", __func__, ggml_type_name(k_all->type), ggml_type_name(v_all->type));
             }
         }
+    }
+
+    if (mctx_cur->get_kv() && mctx_cur->get_kv()->stream_needs_translate()) { // [kv-stream]
+        GGML_ABORT("[kv-stream] the gather path cannot read a streamed K/V cache");
     }
 
     ids = ggml_reshape_1d(ctx0, ids, n_wblk*n_tok);

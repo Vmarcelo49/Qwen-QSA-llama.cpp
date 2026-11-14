@@ -46,6 +46,10 @@ layout (binding = 3) readonly buffer M   {float16_t data_m[];};
 layout (binding = 4) readonly buffer I   {int       data_i[];};
 layout (binding = 5) writeonly buffer O  {float     data_o[];};
 layout (binding = 6) buffer P            {float     data_p[];};   // per-split partials: [row][D + 2]
+layout (binding = 7) readonly buffer SK  {uint16_t  data_sk[];};  // [kv-stream] scratch blocks, for ids with SCRATCH_FLAG
+layout (binding = 8) readonly buffer SV  {uint16_t  data_sv[];};
+
+#define SCRATCH_FLAG 0x40000000u
 
 layout (push_constant) uniform parameter {
     uint  n_head;
@@ -66,6 +70,8 @@ layout (push_constant) uniform parameter {
     uint  i_offset;   // in i32
     uint  o_offset;   // in floats
     float scale;
+    uint  sk_offset;  // in uint16
+    uint  sv_offset;
 } p;
 
 float s8(uint b) {
@@ -108,6 +114,8 @@ void NAME(const uint row, const uint type, const uint d0, const uint dpl, out fl
 
 DEF_LOAD(load_k, data_k)
 DEF_LOAD(load_v, data_v)
+DEF_LOAD(load_sk, data_sk)
+DEF_LOAD(load_sv, data_sv)
 
 void attend() {
     const uint lane  = gl_LocalInvocationID.x;
@@ -149,7 +157,9 @@ void attend() {
         if (!any) {
             continue; // padding block
         }
-        const uint cell0 = uint(data_i[ib + j]) * R;
+        const uint id      = uint(data_i[ib + j]);
+        const bool scratch = (id & SCRATCH_FLAG) != 0u;
+        const uint cell0   = (id & (SCRATCH_FLAG - 1u)) * R;
 
         // q.k for every (head, cell); all lanes agree after subgroupAdd
         float s[MAX_GQA][R];
@@ -157,8 +167,13 @@ void attend() {
         for (uint c = 0; c < R; ++c) {
             if (mv[c] > -60000.0) {
                 float kx[MAX_DPL];
-                load_k(p.k_offset + (cell0 + c) * p.k_nb2 + h_kv * p.k_nb1, p.k_type, d0, dpl, kx);
-                load_v(p.v_offset + (cell0 + c) * p.v_nb2 + h_kv * p.v_nb1, p.v_type, d0, dpl, vx[c]);
+                if (scratch) {
+                    load_sk(p.sk_offset + (cell0 + c) * p.k_nb2 + h_kv * p.k_nb1, p.k_type, d0, dpl, kx);
+                    load_sv(p.sv_offset + (cell0 + c) * p.v_nb2 + h_kv * p.v_nb1, p.v_type, d0, dpl, vx[c]);
+                } else {
+                    load_k(p.k_offset + (cell0 + c) * p.k_nb2 + h_kv * p.k_nb1, p.k_type, d0, dpl, kx);
+                    load_v(p.v_offset + (cell0 + c) * p.v_nb2 + h_kv * p.v_nb1, p.v_type, d0, dpl, vx[c]);
+                }
                 for (uint h = 0; h < GQA; ++h) {
                     float part = 0.0;
                     for (uint d = 0; d < dpl; ++d) {

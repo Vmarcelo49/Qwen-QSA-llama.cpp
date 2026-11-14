@@ -3356,9 +3356,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     if (device->subgroup_arithmetic && device->subgroup_require_full_support &&
         (device->subgroup_size == 64 || device->subgroup_size == 32) && getenv("GGML_VK_QSA_BLOCK_DISABLE") == nullptr) {
         for (uint32_t gqa : { 1u, 2u, 3u, 4u, 6u, 8u }) {
-            ggml_vk_create_pipeline2(device, device->pipeline_qsa_block_attn[gqa], "qsa_block_attn_" + std::to_string(gqa), qsa_block_attn_len, qsa_block_attn_data, "main", 7, sizeof(vk_op_qsa_block_attn_push_constants), {1, 1, 1}, {device->subgroup_size, gqa, 0}, 1, true, true, device->subgroup_size);
+            ggml_vk_create_pipeline2(device, device->pipeline_qsa_block_attn[gqa], "qsa_block_attn_" + std::to_string(gqa), qsa_block_attn_len, qsa_block_attn_data, "main", 9, sizeof(vk_op_qsa_block_attn_push_constants), {1, 1, 1}, {device->subgroup_size, gqa, 0}, 1, true, true, device->subgroup_size);
         }
-        ggml_vk_create_pipeline2(device, device->pipeline_qsa_block_combine, "qsa_block_combine", qsa_block_attn_len, qsa_block_attn_data, "main", 7, sizeof(vk_op_qsa_block_attn_push_constants), {1, 1, 1}, {device->subgroup_size, 1, 1}, 1, true, true, device->subgroup_size);
+        ggml_vk_create_pipeline2(device, device->pipeline_qsa_block_combine, "qsa_block_combine", qsa_block_attn_len, qsa_block_attn_data, "main", 9, sizeof(vk_op_qsa_block_attn_push_constants), {1, 1, 1}, {device->subgroup_size, 1, 1}, 1, true, true, device->subgroup_size);
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
@@ -11222,6 +11222,16 @@ bool ggml_vk_qsa_block_attn_supported(const vk_device& device, const ggml_tensor
             return false;
         }
     }
+    // [kv-stream] optional scratch K/V (src[6], src[7]) for ids with bit 30 set: same row layout as the cache
+    const ggml_tensor * sk = dst->src[6];
+    const ggml_tensor * sv = dst->src[7];
+    if ((sk != nullptr) != (sv != nullptr)) {
+        return false;
+    }
+    if (sk && (sk->type != k->type || sv->type != v->type || sk->ne[0]*(int64_t) sizeof(char) == 0 ||
+               (size_t) k->nb[2] != ggml_row_size(sk->type, sk->ne[0]) || (size_t) v->nb[2] != ggml_row_size(sv->type, sv->ne[0]))) {
+        return false;
+    }
     return q->nb[0] == sizeof(float) && (q->nb[1] % sizeof(float)) == 0 && (q->nb[2] % sizeof(float)) == 0 &&
            ggml_is_contiguous(m) && ggml_is_contiguous(ids) && ggml_is_contiguous(dst) &&
            ids->ne[1] == q->ne[2] && m->ne[0] == ids->ne[0]*4 && m->ne[1] == 1 && m->ne[2] == 1 && m->ne[3] == q->ne[2] &&
@@ -11280,6 +11290,11 @@ void ggml_vk_qsa_block_attn(ggml_backend_vk_context * ctx, vk_context& subctx, g
     vk_subbuffer i_buf = ggml_vk_tensor_subbuffer(ctx, ids, true);
     vk_subbuffer o_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
     vk_subbuffer p_buf = n_split > 1 ? ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0) : o_buf;
+    const ggml_tensor * sk = dst->src[6] ? dst->src[6] : k; // [kv-stream]
+    const ggml_tensor * sv = dst->src[7] ? dst->src[7] : v;
+    vk_subbuffer sk_buf = ggml_vk_tensor_subbuffer(ctx, sk, true);
+    vk_subbuffer sv_buf = ggml_vk_tensor_subbuffer(ctx, sv, true);
+    GGML_ASSERT(get_misalign_bytes(ctx, sk) % 2 == 0 && get_misalign_bytes(ctx, sv) % 2 == 0);
 
     GGML_ASSERT(get_misalign_bytes(ctx, k) % 2 == 0 && get_misalign_bytes(ctx, v) % 2 == 0);
 
@@ -11293,12 +11308,13 @@ void ggml_vk_qsa_block_attn(ggml_backend_vk_context * ctx, vk_context& subctx, g
         get_misalign_bytes(ctx, ids) / (uint32_t) sizeof(int32_t),
         get_misalign_bytes(ctx, dst) / (uint32_t) sizeof(float),
         scale,
+        get_misalign_bytes(ctx, sk) / 2, get_misalign_bytes(ctx, sv) / 2,
     };
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, v_buf, m_buf, i_buf, o_buf, p_buf }, pc, { n_split, n_kv, n_tok });
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, v_buf, m_buf, i_buf, o_buf, p_buf, sk_buf, sv_buf }, pc, { n_split, n_kv, n_tok });
     if (n_split > 1) {
         ggml_vk_sync_buffers(ctx, subctx);
-        ggml_vk_dispatch_pipeline(ctx, subctx, combine, { q_buf, k_buf, v_buf, m_buf, i_buf, o_buf, p_buf }, pc, { 1, n_head, n_tok });
+        ggml_vk_dispatch_pipeline(ctx, subctx, combine, { q_buf, k_buf, v_buf, m_buf, i_buf, o_buf, p_buf, sk_buf, sv_buf }, pc, { 1, n_head, n_tok });
         ctx->prealloc_split_k_need_sync = true;
     }
 }

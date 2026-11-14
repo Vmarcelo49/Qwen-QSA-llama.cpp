@@ -30,6 +30,9 @@ uint32_t llama_kv_plan_eff_take(); // the last planned n_kv, then cleared
 // stale raw keys, which affects the selection of that block only. 0 or unset: off.
 uint32_t llama_kv_cache_raw_ring_rows();
 
+// [kv-stream] the next llama_kv_cache constructed may stream its K/V (the hybrid memory's attention cache only)
+void llama_kv_stream_arm(bool on);
+
 class llama_kv_cache : public llama_memory_i {
 public:
     struct stream_copy_info {
@@ -172,6 +175,25 @@ public:
 
     // [qsa-raw-ring] rows of K storage when smaller than the cell count, else 0. See llama_kv_cache_raw_ring_rows().
     uint32_t store_rows = 0;
+
+    // [kv-stream] QSA K/V streaming (LLAMA_KV_STREAM_CELLS=<P>). The device tensors hold stream_rows = P + T cells per
+    // layer: cells [0, P) at their own index and the most recent T cells in a ring behind them. Every cell >= P also
+    // lives in host memory once it leaves the ring. A sparse attention node reads the blocks its queries selected:
+    // resident ones in place, the others from a scratch region that stream_translate() fills between the block
+    // selection and the attention (it rewrites the node's block ids to physical ones).
+    //   stream_R  first cell that is intact in the ring (a multiple of 4); cells [stream_R, stream_end) are on the device
+    //   stream_H  cells [P, stream_H) are valid in host memory; stream_R <= stream_H
+    uint32_t stream_P = 0, stream_T = 0, stream_rows = 0, stream_scratch_cells = 0;
+    uint32_t stream_R = 0, stream_H = 0, stream_end = 0;
+    bool stream_enabled() const { return stream_rows > 0; }
+    bool stream_needs_translate() const { return stream_rows > 0 && stream_R > stream_P; }
+    uint32_t stream_phys(uint32_t cell) const { return cell < stream_P ? cell : stream_P + (cell - stream_P) % stream_T; }
+    ggml_tensor * stream_scratch_k() const { return stream_sk; }
+    ggml_tensor * stream_scratch_v() const { return stream_sv; }
+    void stream_prepare(uint32_t c0, uint32_t n);
+    void stream_translate(int32_t il, ggml_tensor * ids);
+    static bool stream_eval_cb(ggml_tensor * t, bool ask, void * user_data);
+    static constexpr int32_t STREAM_SCRATCH_FLAG = 0x40000000;
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
@@ -326,6 +348,15 @@ private:
 
     std::vector<kv_layer> layers;
 
+    // [kv-stream]
+    ggml_tensor * stream_sk = nullptr;
+    ggml_tensor * stream_sv = nullptr;
+    std::vector<char *> stream_host_k, stream_host_v; // per cache layer: cells [P, kv_size)
+    std::vector<int32_t> stream_ids;
+    std::vector<char> stream_stage;
+    uint64_t stream_n_calls = 0, stream_n_blocks = 0, stream_n_ids = 0, stream_t_us = 0;
+    void stream_copy(uint32_t cell, uint32_t count, bool to_host);
+
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
@@ -406,6 +437,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    const llama_kv_cache * get_kv() const { return kv; } // [kv-stream]
 
     ggml_type type_k() const;
     ggml_type type_v() const;
