@@ -1881,7 +1881,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         ggml_backend_sched_reset(sched.get());
-        kv_stream_set_eval_callback(); // [kv-stream]
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1937,7 +1937,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 gf_res_prev_active = nullptr;
                 res->reset();
                 ggml_backend_sched_reset(sched.get());
-                kv_stream_set_eval_callback(); // [kv-stream]
+                ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
                 gf = model.build_graph(gparams);
                 if (!gf) {
                     LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -3380,18 +3380,6 @@ static void ubatch_prepare_reserve(
 
 // [reserve-heal] re-reserve with the coming ubatch's graph built against the full memory (n_kv = the whole cache), so
 // that the following ubatches of the same topology fit without the scheduler's per-ubatch re-reserve + sync
-// [kv-stream] a streamed attention cache rewrites the block ids of its sparse attention nodes between the selection
-// and the attention, through the scheduler's eval callback (see llama_kv_cache::stream_translate)
-void llama_context::kv_stream_set_eval_callback() {
-    auto * hybrid = cparams.cb_eval ? nullptr : dynamic_cast<llama_memory_hybrid *>(memory.get());
-    llama_kv_cache * kv = hybrid ? hybrid->get_mem_attn() : nullptr;
-    if (kv && kv->stream_enabled()) {
-        ggml_backend_sched_set_eval_callback(sched.get(), llama_kv_cache::stream_eval_cb, kv);
-    } else {
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
-    }
-}
-
 void llama_context::heal_reserve(const llama_ubatch & ubatch, llm_graph_type gtype) {
     const int64_t t0 = ggml_time_us();
     llama_memory_context_ptr mfull;

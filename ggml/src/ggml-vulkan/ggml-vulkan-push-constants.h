@@ -555,6 +555,23 @@ struct vk_op_qsa_block_attn_push_constants {
     float    scale;
     uint32_t sk_offset; // [kv-stream] scratch K/V for ids with bit 30 set
     uint32_t sv_offset;
+    uint32_t tok_base;
+};
+
+// [kv-stream] qsa_stream.comp
+struct vk_op_qsa_stream_push_constants {
+    uint32_t n_ids;
+    uint32_t p_blocks;
+    uint32_t t_blocks;
+    uint32_t n_slots;
+    uint32_t n_cold;
+    uint32_t n_blocks;
+    uint32_t i_offset;
+    uint32_t m_offset;
+    uint32_t r_offset;
+    uint32_t h_offset;
+    uint32_t d_offset;
+    uint32_t words;
 };
 
 struct vk_op_im2col_push_constants {

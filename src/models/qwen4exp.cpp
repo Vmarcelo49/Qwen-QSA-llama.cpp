@@ -1833,6 +1833,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
 // Attend each query to its selected blocks plus its tail block. With cell == position a block
 // is one row of a [ratio cells] view of the K/V cache, so whole blocks are gathered at once.
+// [kv-stream] what changes from one ubatch to the next for a streamed cache (see llama-kv-cache.h)
+class llm_graph_input_kv_stream : public llm_graph_input_i {
+public:
+    llm_graph_input_kv_stream(const llama_kv_cache * kv) : kv(kv) {}
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        const int32_t data[4] = { (int32_t) kv->stream_R, (int32_t) kv->stream_H, (int32_t) kv->stream_end, 0 };
+        ggml_backend_tensor_set(prm, data, 0, sizeof(data));
+    }
+    bool can_reuse(const llm_graph_params & params) override {
+        GGML_UNUSED(params);
+        return cold == (kv->stream_R > kv->stream_P); // the nodes are built with or without the resolve stage
+    }
+    ggml_tensor * prm = nullptr;
+    const llama_kv_cache * kv;
+    bool cold = false;
+};
+
 ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
         llm_graph_input_attn_kv * inp,
         llm_graph_input_qsa_blk * blk_inp,
@@ -1942,10 +1960,31 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
             out->src[5] = ids;
             const llama_kv_cache * kv_stream = mctx_cur->get_kv(); // [kv-stream]
             if (kv_stream && kv_stream->stream_enabled()) {
-                // the ids are rewritten between the selection and this node (llama_kv_cache::stream_translate)
-                ggml_format_name(ids, "qsa_stream_ids-%d", il);
-                out->src[6] = kv_stream->stream_scratch_k();
-                out->src[7] = kv_stream->stream_scratch_v();
+                // the backend makes the selected cold blocks resident and rewrites the ids to physical blocks before
+                // it attends (ggml-vulkan: ggml_vk_qsa_block_attn). op_params: [7] 1, [8..9] / [10..11] the host K / V
+                // pointers, [12] prefix cells, [13] ring cells, [14] cache slots, [15] cold blocks
+                if (!kv_stream_prm) {
+                    auto sin = std::make_unique<llm_graph_input_kv_stream>(kv_stream);
+                    sin->prm = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4);
+                    ggml_set_input(sin->prm);
+                    ggml_set_name(sin->prm, "kv_stream_prm");
+                    sin->cold = kv_stream->stream_R > kv_stream->stream_P;
+                    kv_stream_prm = sin->prm;
+                    res->add_input(std::move(sin));
+                }
+                // 1: every cell is still at its own index (nothing has left the ring), the backend attends directly;
+                // 2: resolve first
+                const int32_t  one = kv_stream->stream_R > kv_stream->stream_P ? 2 : 1;
+                const uint64_t hk  = (uint64_t) (uintptr_t) kv_stream->stream_host_k_ptr(il);
+                const uint64_t hv  = (uint64_t) (uintptr_t) kv_stream->stream_host_v_ptr(il);
+                const int32_t  geo[4] = { (int32_t) kv_stream->stream_P, (int32_t) kv_stream->stream_T,
+                                          (int32_t) kv_stream->stream_slots, (int32_t) kv_stream->stream_cold_blocks() };
+                memcpy((char *) out->op_params +  7*sizeof(int32_t), &one, sizeof(one));
+                memcpy((char *) out->op_params +  8*sizeof(int32_t), &hk,  sizeof(hk));
+                memcpy((char *) out->op_params + 10*sizeof(int32_t), &hv,  sizeof(hv));
+                memcpy((char *) out->op_params + 12*sizeof(int32_t), geo,  sizeof(geo));
+                out->src[6] = kv_stream->stream_map(il);
+                out->src[7] = kv_stream_prm;
             }
             if (ggml_backend_dev_supports_op(model.dev_layer(il), out)) {
                 cb(out, "kqv_out", il);
@@ -1967,7 +2006,7 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
         }
     }
 
-    if (mctx_cur->get_kv() && mctx_cur->get_kv()->stream_needs_translate()) { // [kv-stream]
+    if (mctx_cur->get_kv() && mctx_cur->get_kv()->stream_enabled() && mctx_cur->get_kv()->stream_R > mctx_cur->get_kv()->stream_P) { // [kv-stream]
         GGML_ABORT("[kv-stream] the gather path cannot read a streamed K/V cache");
     }
 

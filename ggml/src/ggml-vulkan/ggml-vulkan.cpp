@@ -3358,6 +3358,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         for (uint32_t gqa : { 1u, 2u, 3u, 4u, 6u, 8u }) {
             ggml_vk_create_pipeline2(device, device->pipeline_qsa_block_attn[gqa], "qsa_block_attn_" + std::to_string(gqa), qsa_block_attn_len, qsa_block_attn_data, "main", 9, sizeof(vk_op_qsa_block_attn_push_constants), {1, 1, 1}, {device->subgroup_size, gqa, 0}, 1, true, true, device->subgroup_size);
         }
+        // [kv-stream] on-device residency resolve (one workgroup) and the copy of missing blocks from the host buffer
+        if (device->properties.limits.maxComputeWorkGroupInvocations >= 1024) {
+            ggml_vk_create_pipeline2(device, device->pipeline_qsa_stream_resolve, "qsa_stream_resolve", qsa_stream_len, qsa_stream_data, "main", 5, sizeof(vk_op_qsa_stream_push_constants), {1, 1, 1}, {1024, 0}, 1, true);
+            ggml_vk_create_pipeline2(device, device->pipeline_qsa_stream_copy, "qsa_stream_copy", qsa_stream_len, qsa_stream_data, "main", 5, sizeof(vk_op_qsa_stream_push_constants), {1, 1, 1}, {64, 1}, 1, true);
+        }
         ggml_vk_create_pipeline2(device, device->pipeline_qsa_block_combine, "qsa_block_combine", qsa_block_attn_len, qsa_block_attn_data, "main", 9, sizeof(vk_op_qsa_block_attn_push_constants), {1, 1, 1}, {device->subgroup_size, 1, 1}, 1, true, true, device->subgroup_size);
     }
 
@@ -11222,14 +11227,13 @@ bool ggml_vk_qsa_block_attn_supported(const vk_device& device, const ggml_tensor
             return false;
         }
     }
-    // [kv-stream] optional scratch K/V (src[6], src[7]) for ids with bit 30 set: same row layout as the cache
-    const ggml_tensor * sk = dst->src[6];
-    const ggml_tensor * sv = dst->src[7];
-    if ((sk != nullptr) != (sv != nullptr)) {
+    // [kv-stream] a streamed cache: src[6] the layer's residency map, src[7] the per-ubatch parameters
+    if ((dst->src[6] != nullptr) != (dst->src[7] != nullptr)) {
         return false;
     }
-    if (sk && (sk->type != k->type || sv->type != v->type || sk->ne[0]*(int64_t) sizeof(char) == 0 ||
-               (size_t) k->nb[2] != ggml_row_size(sk->type, sk->ne[0]) || (size_t) v->nb[2] != ggml_row_size(sv->type, sv->ne[0]))) {
+    if (dst->src[6] && (dst->src[6]->type != GGML_TYPE_I32 || dst->src[7]->type != GGML_TYPE_I32 || (ggml_get_op_params_i32(dst, 7) != 1 && ggml_get_op_params_i32(dst, 7) != 2) ||
+                        device->pipeline_qsa_stream_resolve == nullptr || device->pipeline_qsa_stream_copy == nullptr ||
+                        (4*k->nb[2]) % 4 != 0 || (4*v->nb[2]) % 4 != 0)) {
         return false;
     }
     return q->nb[0] == sizeof(float) && (q->nb[1] % sizeof(float)) == 0 && (q->nb[2] % sizeof(float)) == 0 &&
@@ -11264,16 +11268,17 @@ void ggml_vk_qsa_block_attn(ggml_backend_vk_context * ctx, vk_context& subctx, g
         const char * e = getenv("GGML_VK_QSA_MIN_BLOCKS");
         return e ? (uint32_t) std::max(1, atoi(e)) : 16u;
     }();
-    uint32_t n_split = std::max(1u, target_waves / (n_tok * n_kv));
+    // [kv-stream] a streamed cache is attended in chunks of queries that cannot name more blocks than it has slots
+    const bool     stream_cold = dst->src[6] != nullptr && ggml_get_op_params_i32(dst, 7) == 2;
+    const uint32_t tok_chunk0  = stream_cold ? std::max(1u, std::min(n_tok, (uint32_t) ggml_get_op_params_i32(dst, 14) / n_wblk)) : n_tok;
+    uint32_t n_split = std::max(1u, target_waves / (tok_chunk0 * n_kv));
     n_split = std::min({ n_split, std::max(1u, n_wblk / min_blocks), 1024u });
 
     vk_pipeline pipeline = ctx->device->pipeline_qsa_block_attn[gqa];
     vk_pipeline combine  = ctx->device->pipeline_qsa_block_combine;
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
-    const size_t part_size = n_split > 1 ? (size_t) n_tok * n_head * n_split * (256 + 2) * sizeof(float) : 0;
+    const size_t part_size = n_split > 1 ? (size_t) tok_chunk0 * n_head * n_split * (256 + 2) * sizeof(float) : 0;
     if (n_split > 1) {
-        ggml_pipeline_request_descriptor_sets(ctx, combine, 1);
         if (ctx->prealloc_size_split_k < part_size) {
             ctx->prealloc_size_split_k = part_size;
             ggml_vk_preallocate_buffers(ctx, subctx);
@@ -11284,21 +11289,76 @@ void ggml_vk_qsa_block_attn(ggml_backend_vk_context * ctx, vk_context& subctx, g
     }
 
     vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q, true);
-    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k, true);
-    vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v, true);
+    // the whole cache tensors: the node's views stop at the cells in use, short of a streamed cache's slots
+    const ggml_tensor * k_root = k; while (k_root->view_src) { k_root = k_root->view_src; }
+    const ggml_tensor * v_root = v; while (v_root->view_src) { v_root = v_root->view_src; }
+    GGML_ASSERT(k_root->data == k->data && v_root->data == v->data);
+    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k_root, true);
+    vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v_root, true);
     vk_subbuffer m_buf = ggml_vk_tensor_subbuffer(ctx, m, true);
     vk_subbuffer i_buf = ggml_vk_tensor_subbuffer(ctx, ids, true);
     vk_subbuffer o_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
     vk_subbuffer p_buf = n_split > 1 ? ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0) : o_buf;
-    const ggml_tensor * sk = dst->src[6] ? dst->src[6] : k; // [kv-stream]
-    const ggml_tensor * sv = dst->src[7] ? dst->src[7] : v;
-    vk_subbuffer sk_buf = ggml_vk_tensor_subbuffer(ctx, sk, true);
-    vk_subbuffer sv_buf = ggml_vk_tensor_subbuffer(ctx, sv, true);
-    GGML_ASSERT(get_misalign_bytes(ctx, sk) % 2 == 0 && get_misalign_bytes(ctx, sv) % 2 == 0);
 
-    GGML_ASSERT(get_misalign_bytes(ctx, k) % 2 == 0 && get_misalign_bytes(ctx, v) % 2 == 0);
+    // [kv-stream] a streamed cache: per chunk of queries, make the selected cold blocks resident and rewrite the ids,
+    // all on the device, then attend. A chunk never names more blocks than the layer has slots, so every block of
+    // a chunk finds one.
+    const bool stream = dst->src[6] != nullptr && ggml_get_op_params_i32(dst, 7) == 2;
+    uint32_t tok_chunk = n_tok;
+    vk_subbuffer map_buf = i_buf, prm_buf = i_buf, hk_buf = k_buf, hv_buf = v_buf;
+    vk_op_qsa_stream_push_constants spc = {};
+    uint32_t hk_off = 0, hv_off = 0, stream_slots = 0;
+    if (stream) {
+        const ggml_tensor * map = dst->src[6];
+        const ggml_tensor * prm = dst->src[7];
+        const uint32_t P  = ggml_get_op_params_i32(dst, 12);
+        const uint32_t T  = ggml_get_op_params_i32(dst, 13);
+        const uint32_t S  = ggml_get_op_params_i32(dst, 14);
+        const uint32_t NC = ggml_get_op_params_i32(dst, 15);
+        stream_slots = S;
+        tok_chunk = std::max(1u, std::min(n_tok, S / n_wblk));
+        GGML_ASSERT(n_wblk <= S && "[kv-stream] fewer cache slots than one query selects");
 
-    const vk_op_qsa_block_attn_push_constants pc = {
+        map_buf = ggml_vk_tensor_subbuffer(ctx, map, true);
+        prm_buf = ggml_vk_tensor_subbuffer(ctx, prm, true);
+        GGML_ASSERT(get_misalign_bytes(ctx, k) % 4 == 0 && get_misalign_bytes(ctx, v) % 4 == 0);
+
+        uint64_t hk_ptr, hv_ptr;
+        memcpy(&hk_ptr, (const char *) dst->op_params +  8*sizeof(int32_t), sizeof(hk_ptr));
+        memcpy(&hv_ptr, (const char *) dst->op_params + 10*sizeof(int32_t), sizeof(hv_ptr));
+        const size_t align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+        const auto host_sub = [&](uint64_t ptr, size_t block_bytes, uint32_t & off_words) {
+            vk_buffer hbuf;
+            size_t    hoff = 0;
+            ggml_vk_host_get(ctx->device, (const void *) (uintptr_t) ptr, hbuf, hoff);
+            GGML_ASSERT(hbuf != nullptr && "[kv-stream] the host K/V store is not device-visible pinned memory");
+            const size_t hoff_al = ggml_vk_descriptor_offset(hoff, align, sizeof(uint32_t));
+            GGML_ASSERT((hoff - hoff_al) % 4 == 0);
+            off_words = (uint32_t) ((hoff - hoff_al) / 4);
+            return vk_subbuffer { hbuf, hoff_al, (size_t) NC * block_bytes + (hoff - hoff_al) };
+        };
+        hk_buf = host_sub(hk_ptr, 4 * k->nb[2], hk_off);
+        hv_buf = host_sub(hv_ptr, 4 * v->nb[2], hv_off);
+
+        spc = {
+            0, P/4, T/4, S, NC, P/4 + NC,
+            get_misalign_bytes(ctx, ids) / (uint32_t) sizeof(int32_t),
+            get_misalign_bytes(ctx, map) / (uint32_t) sizeof(int32_t),
+            get_misalign_bytes(ctx, prm) / (uint32_t) sizeof(int32_t),
+            0, 0, 0,
+        };
+    }
+    const uint32_t n_chunks = (n_tok + tok_chunk - 1) / tok_chunk;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, n_chunks);
+    if (n_split > 1) {
+        ggml_pipeline_request_descriptor_sets(ctx, combine, n_chunks);
+    }
+    if (stream) {
+        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_qsa_stream_resolve, n_chunks);
+        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_qsa_stream_copy, 2*n_chunks);
+    }
+
+    vk_op_qsa_block_attn_push_constants pc = {
         n_head, n_wblk, n_split,
         (uint32_t) ggml_vk_qsa_kv_type(k->type), (uint32_t) ggml_vk_qsa_kv_type(v->type),
         get_misalign_bytes(ctx, q) / (uint32_t) sizeof(float), (uint32_t) (q->nb[1] / sizeof(float)), (uint32_t) (q->nb[2] / sizeof(float)),
@@ -11308,14 +11368,33 @@ void ggml_vk_qsa_block_attn(ggml_backend_vk_context * ctx, vk_context& subctx, g
         get_misalign_bytes(ctx, ids) / (uint32_t) sizeof(int32_t),
         get_misalign_bytes(ctx, dst) / (uint32_t) sizeof(float),
         scale,
-        get_misalign_bytes(ctx, sk) / 2, get_misalign_bytes(ctx, sv) / 2,
+        get_misalign_bytes(ctx, k) / 2, get_misalign_bytes(ctx, v) / 2,
+        0,
     };
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, v_buf, m_buf, i_buf, o_buf, p_buf, sk_buf, sv_buf }, pc, { n_split, n_kv, n_tok });
-    if (n_split > 1) {
-        ggml_vk_sync_buffers(ctx, subctx);
-        ggml_vk_dispatch_pipeline(ctx, subctx, combine, { q_buf, k_buf, v_buf, m_buf, i_buf, o_buf, p_buf, sk_buf, sv_buf }, pc, { 1, n_head, n_tok });
-        ctx->prealloc_split_k_need_sync = true;
+    for (uint32_t t0 = 0; t0 < n_tok; t0 += tok_chunk) {
+        const uint32_t nt = std::min(tok_chunk, n_tok - t0);
+        if (stream) {
+            vk_op_qsa_stream_push_constants c = spc;
+            c.n_ids     = nt * n_wblk;
+            c.i_offset += t0 * n_wblk;
+            ggml_vk_sync_buffers(ctx, subctx);
+            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_qsa_stream_resolve, { i_buf, map_buf, prm_buf, map_buf, map_buf }, c, { 1, 1, 1 });
+            ggml_vk_sync_buffers(ctx, subctx);
+            const uint32_t n_groups = std::min(stream_slots, c.n_ids);
+            c.h_offset = hk_off; c.d_offset = get_misalign_bytes(ctx, k) / 4; c.words = (uint32_t) (k->nb[2]);
+            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_qsa_stream_copy, { i_buf, map_buf, prm_buf, hk_buf, k_buf }, c, { n_groups, 1, 1 });
+            c.h_offset = hv_off; c.d_offset = get_misalign_bytes(ctx, v) / 4; c.words = (uint32_t) (v->nb[2]);
+            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_qsa_stream_copy, { i_buf, map_buf, prm_buf, hv_buf, v_buf }, c, { n_groups, 1, 1 });
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        pc.tok_base = t0;
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, v_buf, m_buf, i_buf, o_buf, p_buf, k_buf, v_buf }, pc, { n_split, n_kv, nt });
+        if (n_split > 1) {
+            ggml_vk_sync_buffers(ctx, subctx);
+            ggml_vk_dispatch_pipeline(ctx, subctx, combine, { q_buf, k_buf, v_buf, m_buf, i_buf, o_buf, p_buf, k_buf, v_buf }, pc, { 1, n_head, nt });
+            ctx->prealloc_split_k_need_sync = true;
+        }
     }
 }
 

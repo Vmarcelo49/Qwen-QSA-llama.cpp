@@ -471,7 +471,6 @@ private:
     int  n_heal            = 0;
     std::vector<int> heal_failed; // node counts a heal did not help
     void heal_reserve(const llama_ubatch & ubatch, llm_graph_type gtype);
-    void kv_stream_set_eval_callback(); // [kv-stream]
 
     // [pp-plan-ahead] env: LLAMA_PP_PLAN_AHEAD=1 (custom tree; see patch-mt-planahead.py). With pipeline parallelism, reserve the
     // scheduler once per decode call with the n_kv of the call's last ubatch, so the later ubatches do not re-reserve
