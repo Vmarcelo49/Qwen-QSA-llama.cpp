@@ -1744,6 +1744,19 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         m_align =  64;
         s_align =  32;
 
+        // [tile-tune] GGML_VK_L_WARPTILE_MMQ="BLOCK,BM,BN,BK,WM,WN,WMITER" overrides the large tile of the
+        // quantized (dequant) matmul for tuning sweeps; TM/TN/TK/WARP keep their values.
+        if (const char * ov = getenv("GGML_VK_L_WARPTILE_MMQ")) {
+            uint32_t v[7];
+            if (sscanf(ov, "%u,%u,%u,%u,%u,%u,%u", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6]) == 7) {
+                for (int i = 0; i < 7; i++) {
+                    l_warptile_mmq[i] = v[i];
+                }
+                l_mmq_wg_denoms = { v[1], v[2], 1 };
+                GGML_LOG_INFO("ggml_vulkan: [tile-tune] l_warptile_mmq = %s\n", ov);
+            }
+        }
+
         if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support) {
             // Xe1/Xe2/Xe3 with coopmat enabled - warptile performance tuning
             l_warptile = { 512, 128, 128, 16, mm_warp_8, 32, 2, tm_l, tn_l, tk_l, mm_warp_8 };
