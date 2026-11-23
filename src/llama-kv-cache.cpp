@@ -73,7 +73,7 @@ void llama_kv_stream_arm(bool on) {
 void llama_kv_cache::stream_copy(uint32_t cell, uint32_t count, bool to_host) {
     while (count > 0) {
         const uint32_t phys = stream_phys(cell);
-        const uint32_t run  = std::min(count, stream_rows - phys);
+        const uint32_t run  = std::min(count, stream_P + stream_T - phys); // the ring wraps before the slot rows
         for (size_t i = 0; i < layers.size(); ++i) {
             const size_t rk = ggml_row_size(layers[i].k->type, layers[i].k->ne[0]);
             const size_t rv = ggml_row_size(layers[i].v->type, layers[i].v->ne[0]);
