@@ -335,7 +335,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     auto * original_mask = inp->self_kq_mask_cnv;
     ggml_tensor * top_blocks = nullptr;
     llm_graph_input_qsa_blk * block_input = nullptr;
-    if (hparams.indexer_head_size > 0 && cparams.qsa_enabled && !getenv("LLAMA_QSA_DENSE")) {
+    // a graph over several streams is only a reserve graph (ubatches hold one sequence each): it takes the dense path
+    if (hparams.indexer_head_size > 0 && cparams.qsa_enabled && !getenv("LLAMA_QSA_DENSE") &&
+            static_cast<const llama_memory_hybrid_idx_context *>(mctx)->get_n_stream() == 1) {
         const auto * hybrid = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
         const auto ratio = hparams.dsv4_compress_ratios[il];
         const bool cached = hybrid->get_blk() && (hybrid->blk_ok() || !hybrid->get_attn()->has_ubatch());

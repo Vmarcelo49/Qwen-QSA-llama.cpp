@@ -11382,7 +11382,11 @@ void ggml_vk_qsa_block_attn(ggml_backend_vk_context * ctx, vk_context& subctx, g
     // the whole cache tensors: the node's views stop at the cells in use, short of a streamed cache's slots
     const ggml_tensor * k_root = k; while (k_root->view_src) { k_root = k_root->view_src; }
     const ggml_tensor * v_root = v; while (v_root->view_src) { v_root = v_root->view_src; }
-    GGML_ASSERT(k_root->data == k->data && v_root->data == v->data);
+    // a view may start past its root (the K/V of a later stream): offsets count from the root's binding
+    GGML_ASSERT(k->data >= k_root->data && v->data >= v_root->data);
+    const size_t k_off_bytes = get_misalign_bytes(ctx, k_root) + (size_t) ((const char *) k->data - (const char *) k_root->data);
+    const size_t v_off_bytes = get_misalign_bytes(ctx, v_root) + (size_t) ((const char *) v->data - (const char *) v_root->data);
+    GGML_ASSERT(k_off_bytes % 4 == 0 && v_off_bytes % 4 == 0 && k_off_bytes/2 <= UINT32_MAX && v_off_bytes/2 <= UINT32_MAX);
     vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k_root, true);
     vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v_root, true);
     vk_subbuffer m_buf = ggml_vk_tensor_subbuffer(ctx, m, true);
@@ -11411,7 +11415,6 @@ void ggml_vk_qsa_block_attn(ggml_backend_vk_context * ctx, vk_context& subctx, g
 
         map_buf = ggml_vk_tensor_subbuffer(ctx, map, true);
         prm_buf = ggml_vk_tensor_subbuffer(ctx, prm, true);
-        GGML_ASSERT(get_misalign_bytes(ctx, k) % 4 == 0 && get_misalign_bytes(ctx, v) % 4 == 0);
 
         uint64_t hk_ptr, hv_ptr;
         memcpy(&hk_ptr, (const char *) dst->op_params +  8*sizeof(int32_t), sizeof(hk_ptr));
@@ -11452,13 +11455,13 @@ void ggml_vk_qsa_block_attn(ggml_backend_vk_context * ctx, vk_context& subctx, g
         n_head, n_wblk, n_split,
         (uint32_t) ggml_vk_qsa_kv_type(k->type), (uint32_t) ggml_vk_qsa_kv_type(v->type),
         get_misalign_bytes(ctx, q) / (uint32_t) sizeof(float), (uint32_t) (q->nb[1] / sizeof(float)), (uint32_t) (q->nb[2] / sizeof(float)),
-        get_misalign_bytes(ctx, k) / 2, (uint32_t) (k->nb[1] / 2), (uint32_t) (k->nb[2] / 2),
-        get_misalign_bytes(ctx, v) / 2, (uint32_t) (v->nb[1] / 2), (uint32_t) (v->nb[2] / 2),
+        (uint32_t) (k_off_bytes / 2), (uint32_t) (k->nb[1] / 2), (uint32_t) (k->nb[2] / 2),
+        (uint32_t) (v_off_bytes / 2), (uint32_t) (v->nb[1] / 2), (uint32_t) (v->nb[2] / 2),
         get_misalign_bytes(ctx, m) / (uint32_t) sizeof(ggml_fp16_t),
         get_misalign_bytes(ctx, ids) / (uint32_t) sizeof(int32_t),
         get_misalign_bytes(ctx, dst) / (uint32_t) sizeof(float),
         scale,
-        get_misalign_bytes(ctx, k) / 2, get_misalign_bytes(ctx, v) / 2,
+        (uint32_t) (k_off_bytes / 2), (uint32_t) (v_off_bytes / 2),
         0,
     };
 
@@ -11472,9 +11475,9 @@ void ggml_vk_qsa_block_attn(ggml_backend_vk_context * ctx, vk_context& subctx, g
             ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_qsa_stream_resolve, { i_buf, map_buf, prm_buf, map_buf, map_buf }, c, { 1, 1, 1 });
             ggml_vk_sync_buffers(ctx, subctx);
             const uint32_t n_groups = std::min(stream_slots, c.n_ids);
-            c.h_offset = hk_off; c.d_offset = get_misalign_bytes(ctx, k) / 4; c.words = (uint32_t) (k->nb[2]);
+            c.h_offset = hk_off; c.d_offset = (uint32_t) (k_off_bytes / 4); c.words = (uint32_t) (k->nb[2]);
             ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_qsa_stream_copy, { i_buf, map_buf, prm_buf, hk_buf, k_buf }, c, { n_groups, 1, 1 });
-            c.h_offset = hv_off; c.d_offset = get_misalign_bytes(ctx, v) / 4; c.words = (uint32_t) (v->nb[2]);
+            c.h_offset = hv_off; c.d_offset = (uint32_t) (v_off_bytes / 4); c.words = (uint32_t) (v->nb[2]);
             ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_qsa_stream_copy, { i_buf, map_buf, prm_buf, hv_buf, v_buf }, c, { n_groups, 1, 1 });
             ggml_vk_sync_buffers(ctx, subctx);
         }

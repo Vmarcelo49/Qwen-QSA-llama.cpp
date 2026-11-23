@@ -69,22 +69,39 @@ void llama_kv_stream_arm(bool on) {
     llama_kv_stream_armed = on && getenv("LLAMA_KV_STREAM_CELLS") != nullptr;
 }
 
-// cells [cell, cell + count), all >= P: device -> host (to_host) or host -> device, every layer
-void llama_kv_cache::stream_copy(uint32_t cell, uint32_t count, bool to_host) {
+const char * llama_kv_cache::stream_host_k_ptr(int32_t il, uint32_t s) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    return stream_host_k[ikv] + (size_t) s*(get_size() - stream_P)*ggml_row_size(layers[ikv].k->type, layers[ikv].k->ne[0]);
+}
+
+const char * llama_kv_cache::stream_host_v_ptr(int32_t il, uint32_t s) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    return stream_host_v[ikv] + (size_t) s*(get_size() - stream_P)*ggml_row_size(layers[ikv].v->type, layers[ikv].v->ne[0]);
+}
+
+// cells [cell, cell + count) of stream s, all >= P: device -> host (to_host) or host -> device, every layer
+void llama_kv_cache::stream_copy(uint32_t s, uint32_t cell, uint32_t count, bool to_host) {
+    // the copies go through another queue than the graphs: finish those first
+    if (stream_sync) {
+        stream_sync();
+    }
+    const size_t n_host = get_size() - stream_P;
     while (count > 0) {
         const uint32_t phys = stream_phys(cell);
         const uint32_t run  = std::min(count, stream_P + stream_T - phys); // the ring wraps before the slot rows
         for (size_t i = 0; i < layers.size(); ++i) {
             const size_t rk = ggml_row_size(layers[i].k->type, layers[i].k->ne[0]);
             const size_t rv = ggml_row_size(layers[i].v->type, layers[i].v->ne[0]);
-            char * hk = stream_host_k[i] + (size_t) (cell - stream_P)*rk;
-            char * hv = stream_host_v[i] + (size_t) (cell - stream_P)*rv;
+            char * hk = stream_host_k[i] + ((size_t) s*n_host + (cell - stream_P))*rk;
+            char * hv = stream_host_v[i] + ((size_t) s*n_host + (cell - stream_P))*rv;
+            const size_t dk = (size_t) s*layers[i].k->nb[2] + (size_t) phys*rk;
+            const size_t dv = (size_t) s*layers[i].v->nb[2] + (size_t) phys*rv;
             if (to_host) {
-                ggml_backend_tensor_get(layers[i].k, hk, (size_t) phys*rk, (size_t) run*rk);
-                ggml_backend_tensor_get(layers[i].v, hv, (size_t) phys*rv, (size_t) run*rv);
+                ggml_backend_tensor_get(layers[i].k, hk, dk, (size_t) run*rk);
+                ggml_backend_tensor_get(layers[i].v, hv, dv, (size_t) run*rv);
             } else {
-                ggml_backend_tensor_set(layers[i].k, hk, (size_t) phys*rk, (size_t) run*rk);
-                ggml_backend_tensor_set(layers[i].v, hv, (size_t) phys*rv, (size_t) run*rv);
+                ggml_backend_tensor_set(layers[i].k, hk, dk, (size_t) run*rk);
+                ggml_backend_tensor_set(layers[i].v, hv, dv, (size_t) run*rv);
             }
         }
         cell  += run;
@@ -92,28 +109,29 @@ void llama_kv_cache::stream_copy(uint32_t cell, uint32_t count, bool to_host) {
     }
 }
 
-// called before an ubatch writes cells [c0, c0 + n)
-void llama_kv_cache::stream_prepare(uint32_t c0, uint32_t n) {
+// called before an ubatch writes cells [c0, c0 + n) of stream s
+void llama_kv_cache::stream_prepare(uint32_t s, uint32_t c0, uint32_t n) {
     const uint32_t P = stream_P;
     const uint32_t T = stream_T;
+    auto & st = sst[s];
     if (n + 8 > T) { GGML_ABORT("[kv-stream] the ring (%u cells) is smaller than the batch (%u)", T, n); }
-    if (c0 > stream_end) { GGML_ABORT("[kv-stream] cells [%u, %u) were skipped", stream_end, c0); }
+    if (c0 > st.end) { GGML_ABORT("[kv-stream] stream %u: cells [%u, %u) were skipped", s, st.end, c0); }
 
-    stream_check();
-    stream_last_n = n;
+    stream_check(s);
+    st.last_n = n;
 
-    if (c0 < stream_end) { // the cells from c0 on were dropped (rejected drafts, an edited prompt)
+    if (c0 < st.end) { // the cells from c0 on were dropped (rejected drafts, an edited prompt)
         if (c0 <= P) {
-            if (stream_R > P) { stream_reset_maps(); }
-            stream_R = stream_H = P;
+            if (st.R > P) { stream_reset_maps(s); }
+            st.R = st.H = P;
         } else {
-            stream_H = std::min(stream_H, c0);
-            if (c0 < stream_R) {
+            st.H = std::min(st.H, c0);
+            if (c0 < st.R) {
                 // the ring's content is gone; the block being continued comes back from the host
                 const uint32_t r = c0 & ~3u;
-                stream_copy(r, c0 - r, false);
-                stream_R = r;
-                stream_reset_maps(); // cached blocks from r on are stale
+                stream_copy(s, r, c0 - r, false);
+                st.R = r;
+                stream_reset_maps(s); // cached blocks from r on are stale
             }
         }
     }
@@ -121,25 +139,29 @@ void llama_kv_cache::stream_prepare(uint32_t c0, uint32_t n) {
     const uint32_t e = c0 + n;
     if (e > P) {
         uint32_t r_new = e > T ? ((e - T + 3) & ~3u) : 0;
-        r_new = std::max({ r_new, stream_R, P });
-        if (r_new > stream_H) { // device-only cells are about to leave the ring
+        r_new = std::max({ r_new, st.R, P });
+        if (r_new > st.H) { // device-only cells are about to leave the ring
             const int64_t t0 = ggml_time_us();
-            stream_copy(stream_H, c0 - stream_H, true);
-            LLAMA_LOG_DEBUG("%s: [kv-stream] cells [%u, %u) copied to the host in %.1f ms\n", __func__, stream_H, c0, (ggml_time_us() - t0)/1000.0);
-            stream_H = c0;
+            stream_copy(s, st.H, c0 - st.H, true);
+            LLAMA_LOG_DEBUG("%s: [kv-stream] stream %u: cells [%u, %u) copied to the host in %.1f ms\n", __func__, s, st.H, c0, (ggml_time_us() - t0)/1000.0);
+            st.H = c0;
         }
-        GGML_ASSERT(r_new <= stream_H);
-        stream_R = r_new;
+        GGML_ASSERT(r_new <= st.H);
+        st.R = r_new;
     }
-    stream_end = e;
+    st.end = e;
 }
 
 // every block evicted: page tables all -1, slots free, counters zero
-void llama_kv_cache::stream_reset_maps() {
+void llama_kv_cache::stream_reset_maps(int32_t s) {
     const size_t n_cold = stream_cold_blocks();
     std::vector<int32_t> init(16 + n_cold + 5*(size_t) stream_slots, 0);
     std::fill(init.begin() + 16, init.begin() + 16 + n_cold + stream_slots, -1); // page_table, slot_block
-    for (ggml_tensor * map : stream_maps) {
+    for (size_t i = 0; i < stream_maps.size(); ++i) {
+        if (s >= 0 && i % n_stream != (size_t) s) {
+            continue;
+        }
+        ggml_tensor * map = stream_maps[i];
         GGML_ASSERT((size_t) ggml_nelements(map) == init.size());
         ggml_backend_tensor_set(map, init.data(), 0, init.size()*sizeof(int32_t));
     }
@@ -147,27 +169,28 @@ void llama_kv_cache::stream_reset_maps() {
 
 // A batch that selects more distinct cold blocks than a layer has slots cannot be resolved: the shader counts those
 // blocks (ctl[3]). Only batches larger than slots / (blocks per query) can get there, so decode steps skip the readback.
-void llama_kv_cache::stream_check() {
+void llama_kv_cache::stream_check(uint32_t s) {
     static const int log_every = [] { const char * e = getenv("LLAMA_KV_STREAM_LOG"); return e ? atoi(e) : 0; }();
-    stream_n_prepare++;
-    const bool check = stream_R > stream_P && (uint64_t) stream_last_n*640 > stream_slots;
-    const bool log   = log_every > 0 && stream_R > stream_P && stream_n_prepare % log_every == 0;
+    auto & st = sst[s];
+    st.n_prepare++;
+    const bool check = st.R > stream_P && (uint64_t) st.last_n*640 > stream_slots;
+    const bool log   = log_every > 0 && st.R > stream_P && st.n_prepare % log_every == 0;
     if (!check && !log) {
         return;
     }
     int64_t miss = 0, calls = 0, ids = 0;
-    for (size_t i = 0; i < stream_maps.size(); ++i) {
+    for (size_t i = s; i < stream_maps.size(); i += n_stream) {
         int32_t ctl[16];
         ggml_backend_tensor_get(stream_maps[i], ctl, 0, sizeof(ctl));
         if (ctl[3] != 0) {
-            GGML_ABORT("[kv-stream] layer %zu: a batch of %u tokens selected %d more cold blocks than the %u slots hold: "
-                    "raise LLAMA_KV_STREAM_SLOTS or lower -ub", i, stream_last_n, ctl[3], stream_slots);
+            GGML_ABORT("[kv-stream] layer %zu, stream %u: a batch of %u tokens selected %d more cold blocks than the %u slots hold: "
+                    "raise LLAMA_KV_STREAM_SLOTS or lower -ub", i / n_stream, s, st.last_n, ctl[3], stream_slots);
         }
         miss += ctl[4]; calls += ctl[5]; ids += ctl[6];
     }
     if (log) {
-        LLAMA_LOG_INFO("%s: [kv-stream] totals: %lld calls, %lld ids, %lld blocks copied from the host (%.1f per call); end %u, ring from %u, host to %u\n",
-                __func__, (long long) calls, (long long) ids, (long long) miss, calls ? (double) miss/calls : 0.0, stream_end, stream_R, stream_H);
+        LLAMA_LOG_INFO("%s: [kv-stream] stream %u totals: %lld calls, %lld ids, %lld blocks copied from the host (%.1f per call); end %u, ring from %u, host to %u\n",
+                __func__, s, (long long) calls, (long long) ids, (long long) miss, calls ? (double) miss/calls : 0.0, st.end, st.R, st.H);
     }
 }
 // ------------------------------------------------------------------------------------------------------------------------
@@ -215,7 +238,7 @@ llama_kv_cache::llama_kv_cache(
         llama_kv_stream_armed = false;
         const char * e = getenv("LLAMA_KV_STREAM_CELLS");
         const int64_t P = e ? atoll(e) : 0;
-        if (armed && P > 0 && model.arch == LLM_ARCH_QWEN35 && n_stream == 1 && offload && !other && !v_trans) {
+        if (armed && P > 0 && model.arch == LLM_ARCH_QWEN35 && offload && !other && !v_trans) {
             const char * et = getenv("LLAMA_KV_STREAM_RING");
             const char * es = getenv("LLAMA_KV_STREAM_SLOTS");
             const int64_t T = et ? atoll(et) : 8192;
@@ -225,7 +248,8 @@ llama_kv_cache::llama_kv_cache(
             }
             if ((uint64_t) (P + T + 4*S) < kv_size) {
                 stream_P = P; stream_T = T; stream_slots = S; stream_rows = P + T + 4*S;
-                stream_R = stream_H = P;
+                sst.assign(n_stream, stream_state());
+                for (auto & st : sst) { st.R = st.H = P; }
                 LLAMA_LOG_INFO("%s: [kv-stream] %u of %u cells on the device per layer (%u prefix + %u ring + %u cached blocks)\n",
                         __func__, stream_rows, kv_size, stream_P, stream_T, stream_slots);
             }
@@ -365,7 +389,7 @@ llama_kv_cache::llama_kv_cache(
 
         // [qsa-raw-ring] only the indexer cache of the sparse Qwen3.5 path
         store_rows = 0;
-        if (model.arch == LLM_ARCH_QWEN35 && name_tag && strcmp(name_tag, "idx_") == 0 && n_stream == 1) {
+        if (model.arch == LLM_ARCH_QWEN35 && name_tag && strcmp(name_tag, "idx_") == 0) {
             const uint32_t ring = llama_kv_cache_raw_ring_rows();
             if (ring > 0 && ring < kv_size) { store_rows = ring; }
         }
@@ -377,16 +401,18 @@ llama_kv_cache::llama_kv_cache(
 
         if (stream_rows) { // [kv-stream] the residency map, and the host copy of this layer in device-visible host memory
             GGML_ASSERT(has_k && has_v);
-            ggml_tensor * map = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 16 + (kv_size - stream_P)/4 + 5*(int64_t) stream_slots);
-            ggml_format_name(map, "cache_stream_map_l%d", il);
-            stream_maps.push_back(map);
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                ggml_tensor * map = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 16 + (kv_size - stream_P)/4 + 5*(int64_t) stream_slots);
+                ggml_format_name(map, "cache_stream_map_l%d_s%u", il, s);
+                stream_maps.push_back(map);
+            }
 
             ggml_backend_buffer_type_t hbuft = ggml_backend_dev_host_buffer_type(model.dev_layer(il));
             if (!hbuft) { throw std::runtime_error("[kv-stream] this device has no host buffer type"); }
             ggml_init_params hp = { 2*ggml_tensor_overhead(), nullptr, true };
             ggml_context_ptr hctx { ggml_init(hp) };
-            ggml_tensor * hk = ggml_new_tensor_2d(hctx.get(), type_k, n_embd_k_gqa, kv_size - stream_P);
-            ggml_tensor * hv = ggml_new_tensor_2d(hctx.get(), type_v, n_embd_v_gqa, kv_size - stream_P);
+            ggml_tensor * hk = ggml_new_tensor_3d(hctx.get(), type_k, n_embd_k_gqa, kv_size - stream_P, n_stream);
+            ggml_tensor * hv = ggml_new_tensor_3d(hctx.get(), type_v, n_embd_v_gqa, kv_size - stream_P, n_stream);
             ggml_backend_buffer_t hbuf = ggml_backend_alloc_ctx_tensors_from_buft(hctx.get(), hbuft);
             if (!hbuf || ggml_backend_buffer_get_type(hbuf) != hbuft) {
                 throw std::runtime_error("[kv-stream] failed to allocate the device-visible host K/V store");
@@ -458,7 +484,7 @@ llama_kv_cache::llama_kv_cache(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
-    if (stream_rows && !hparams.no_alloc) { stream_reset_maps(); } // [kv-stream]
+    if (stream_rows && !hparams.no_alloc) { stream_reset_maps(-1); } // [kv-stream]
 
     {
         const size_t memory_size_k = size_k_bytes();
@@ -537,15 +563,14 @@ void llama_kv_cache::clear(bool data) {
         v_cells[s].reset();
         v_heads[s] = 0;
     }
-    stream_R = stream_H = stream_P; // [kv-stream]
-    stream_end = 0;
-    if (stream_rows && !hparams.no_alloc && !data) { stream_reset_maps(); }
+    for (auto & st : sst) { st.R = st.H = stream_P; st.end = 0; } // [kv-stream]
+    if (stream_rows && !hparams.no_alloc && !data) { stream_reset_maps(-1); }
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
-        if (stream_rows && !hparams.no_alloc) { stream_reset_maps(); } // [kv-stream]
+        if (stream_rows && !hparams.no_alloc) { stream_reset_maps(-1); } // [kv-stream]
     }
 }
 
@@ -883,6 +908,21 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
         while (room > 0 && (int64_t) v_cells[0].get_used() > room && seq_pos_max(0) >= 0) {
             const llama_pos pmin = seq_pos_min(0);
             seq_rm(0, pmin, (llama_pos) (pmin + std::max<int64_t>(1, (int64_t) v_cells[0].get_used() - room)));
+        }
+    } else if (mtp_window) {
+        // a stream per sequence: each stream keeps its own window
+        const llama_batch & batch = balloc.get_batch();
+        std::vector<int64_t> n_new(n_stream, 0);
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            n_new[seq_to_stream[batch.seq_id[i][0]]]++;
+        }
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const int64_t room = (int64_t) get_size() - n_new[s] - 8;
+            // seq s owns stream s (seq_to_stream is the identity when there is a stream per sequence)
+            while (n_new[s] > 0 && room > 0 && (int64_t) v_cells[s].get_used() > room && seq_pos_max(s) >= 0) {
+                const llama_pos pmin = seq_pos_min(s);
+                seq_rm(s, pmin, (llama_pos) (pmin + std::max<int64_t>(1, (int64_t) v_cells[s].get_used() - room)));
+            }
         }
     }
 
@@ -1291,11 +1331,12 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
 
     if (stream_rows && sinfo.size() > 0) { // [kv-stream] before this ubatch's rows are written
+        GGML_ASSERT(sinfo.n_stream() == 1 && "[kv-stream] an ubatch writes one stream");
         const auto & ix = sinfo.idxs[0];
         for (size_t i = 1; i < ix.size(); ++i) {
             if (ix[i] != ix[0] + i) { GGML_ABORT("[kv-stream] the ubatch does not take consecutive cells"); }
         }
-        stream_prepare(ix[0], (uint32_t) ix.size());
+        stream_prepare(sinfo.strm[0], ix[0], (uint32_t) ix.size());
     }
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
@@ -1517,7 +1558,6 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * k = layers[ikv].k;
 
-    const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
 
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
@@ -1532,8 +1572,8 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             ggml_row_size(k->type, n_embd_k_gqa),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            k->nb[2],
+            k->nb[2]*sinfo.s0); // [qsa-raw-ring] a stream holds k->ne[1] rows
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1557,8 +1597,8 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
                 hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+                v->nb[2],                                               // v->nb[3]
+                v->nb[2]*sinfo.s0);
     }
 
     // note: v->nb[1] > v->nb[2]
@@ -1592,13 +1632,10 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     const int64_t n_stream = k->ne[2];
 
     if (n_stream > 1) {
-        const int64_t kv_size = get_size();
-
         assert(n_embd_gqa == k->ne[0]);
-        assert(kv_size    == k->ne[1]);
 
         // merge the buffer across all streams because the idxs are global
-        k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
+        k = ggml_reshape_2d(ctx, k, n_embd_gqa, k->ne[1]*n_stream); // [qsa-raw-ring] k->ne[1] rows per stream
     }
 
     // store the current K values into the cache
@@ -1628,13 +1665,10 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
         v_cur = ggml_view_2d(ctx, v_cur, n_embd_gqa, n_tokens, v_cur->nb[2], 0);
 
         if (n_stream > 1) {
-            const int64_t kv_size = get_size();
-
             assert(n_embd_gqa == v->ne[0]);
-            assert(kv_size    == v->ne[1]);
 
             // merge the buffer across all streams because the idxs are global
-            v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
+            v = ggml_reshape_2d(ctx, v, n_embd_gqa, v->ne[1]*n_stream);
         }
 
         return ggml_set_rows(ctx, v, v_cur, v_idxs);
@@ -1738,10 +1772,11 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     int64_t * data = (int64_t *) dst->data;
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-        const int64_t offs = sinfo.strm[s]*get_size();
+        // [qsa-raw-ring] [kv-stream] a stream holds the rows its storage has, which can be fewer than its cells
+        const int64_t offs_k = sinfo.strm[s]*(int64_t) (store_rows ? store_rows : stream_rows ? stream_rows : get_size());
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
-            data[s*sinfo.size() + i] = offs + (store_rows ? sinfo.idxs[s][i] % store_rows : stream_rows ? stream_phys(sinfo.idxs[s][i]) : sinfo.idxs[s][i]); // [qsa-raw-ring] [kv-stream]
+            data[s*sinfo.size() + i] = offs_k + (store_rows ? sinfo.idxs[s][i] % store_rows : stream_rows ? stream_phys(sinfo.idxs[s][i]) : sinfo.idxs[s][i]); // [qsa-raw-ring] [kv-stream]
         }
     }
 }
@@ -1755,7 +1790,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
 
     if (!v_trans) {
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            const int64_t offs = sinfo.strm[s]*get_size();
+            const int64_t offs = sinfo.strm[s]*(int64_t) (stream_rows ? stream_rows : get_size()); // [kv-stream]
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
                 data[s*sinfo.size() + i] = offs + (stream_rows ? stream_phys(sinfo.idxs[s][i]) : sinfo.idxs[s][i]); // [kv-stream]
@@ -3064,7 +3099,7 @@ bool llama_kv_cache_context::ubatch_cells_follow() const {
     }
     const auto & sinfo  = sinfos[i_cur];
     const auto & ubatch = ubatches[i_cur];
-    if (sinfo.n_stream() != 1 || sinfo.strm[0] != 0 || sinfo.size() == 0 || ubatch.n_tokens == 0) {
+    if (sinfo.n_stream() != 1 || sinfo.size() == 0 || ubatch.n_tokens == 0) {
         return false;
     }
     const uint32_t c0 = sinfo.idxs[0][0];
@@ -3077,6 +3112,11 @@ bool llama_kv_cache_context::ubatch_cells_follow() const {
     const auto & cells = kv->get_cells(ubatch.seq_id[0][0]);
     const uint32_t end = c0 + sinfo.size();
     return cells.used_max_p1() == end && cells.get_used() == end;
+}
+
+uint32_t llama_kv_cache_context::ubatch_stream() const {
+    GGML_ASSERT(has_ubatch() && sinfos[i_cur].n_stream() == 1);
+    return sinfos[i_cur].strm[0];
 }
 
 uint32_t llama_kv_cache_context::ubatch_cell0() const {

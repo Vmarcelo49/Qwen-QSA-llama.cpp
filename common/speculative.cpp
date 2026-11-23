@@ -3280,7 +3280,9 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
     // [mtp-window] only the MTP draft context: see llama_memory_hybrid_idx::init_batch
     if (const char * e = getenv("LLAMA_MTP_WINDOW"); e && atoi(e) > 0 && spec_mtp) {
-        cparams.n_ctx = std::min<uint32_t>(cparams.n_ctx, (uint32_t) atoi(e));
+        // with a stream per sequence, each stream gets the whole window
+        const uint32_t n_stream = cparams.kv_unified ? 1 : std::max<uint32_t>(1, cparams.n_seq_max);
+        cparams.n_ctx = std::min<uint32_t>(cparams.n_ctx, (uint32_t) atoi(e) * n_stream);
     }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types

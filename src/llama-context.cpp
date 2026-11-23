@@ -457,6 +457,15 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        // [kv-stream] the host copies of a streamed cache must see the rows the graphs in flight still write
+        if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get()); hyb && hyb->get_mem_attn()->stream_enabled()) {
+            hyb->get_mem_attn()->stream_sync = [this]() {
+                if (sched) {
+                    ggml_backend_sched_synchronize(sched.get());
+                }
+            };
+        }
     }
 
     // init backends
@@ -3589,8 +3598,8 @@ struct llama_la_snap {
     int32_t  rs_z = -1;
     std::vector<uint32_t> rs_idx;
     std::vector<llama_memory_recurrent::mem_cell> cells;
-    bool     has_blk = false, blk_valid = false, blk_rebuild = false;
-    uint32_t blk_tries = 0;
+    bool     has_blk = false;
+    std::vector<llama_memory_hybrid_idx::blk_state> blk_states;
 };
 
 static std::map<const void *, llama_la_snap> & llama_la_snaps() {
@@ -3607,9 +3616,7 @@ static void llama_la_snap_take(llama_la_snap & s, llama_memory_i * memory) {
     auto * hi = dynamic_cast<llama_memory_hybrid_idx *>(memory);
     s.has_blk = hi != nullptr;
     if (hi) {
-        s.blk_valid   = hi->get_blk_valid();
-        s.blk_rebuild = hi->get_blk_rebuild();
-        s.blk_tries   = hi->get_blk_rebuild_tries();
+        s.blk_states = hi->get_blk_states();
     }
 }
 
@@ -3621,11 +3628,7 @@ static void llama_la_snap_put(const llama_la_snap & s, llama_memory_i * memory) 
     r->cells  = s.cells;
     auto * hi = dynamic_cast<llama_memory_hybrid_idx *>(memory);
     if (hi && s.has_blk) {
-        hi->set_blk_valid(s.blk_valid);
-        if (s.blk_valid) {
-            hi->set_blk_rebuild(s.blk_rebuild);
-            hi->set_blk_rebuild_tries(s.blk_tries);
-        }
+        hi->set_blk_states(s.blk_states);
     }
 }
 
