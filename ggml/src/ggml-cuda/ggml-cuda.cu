@@ -7015,7 +7015,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #ifdef GGML_USE_MUSA
             return false;
 #else
-            return true;
+            // the replay of pending tokens (op param 1, see ggml_gated_delta_net_ext) is not ported to this kernel yet
+            return ggml_get_op_params_i32(op, 1) == 0;
 #endif // GGML_USE_MUSA
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&

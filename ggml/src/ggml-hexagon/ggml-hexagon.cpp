@@ -7332,7 +7332,8 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
             break;
 
         case GGML_OP_GATED_DELTA_NET:
-            supp = ggml_hexagon_supported_gated_delta_net(sess, op);
+            // the replay of pending tokens (op param 1, see ggml_gated_delta_net_ext) is not ported
+            supp = ggml_get_op_params_i32(op, 1) == 0 && ggml_hexagon_supported_gated_delta_net(sess, op);
             break;
 
         case GGML_OP_CUMSUM:

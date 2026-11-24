@@ -3559,9 +3559,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const std::array<uint32_t, 3> wg_denoms = {1u, 1u, cols_per_wg};
 
             for (uint32_t kda = 0; kda < 2; kda++) {
-                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
-                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
+                for (uint32_t rep = 0; rep < 2; rep++) {
+                    const std::string name = std::string(gdn_names[si][kda]) + (rep ? "_rep" : "");
+                    ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda][rep],
+                        name.c_str(), gdn_len, gdn_data, "main", 11, sizeof(vk_op_gated_delta_net_push_constants),
+                        wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column, rep}, 1, true, use_subgroup_ops, device->subgroup_size);
+                }
             }
         }
     }
@@ -8945,6 +8948,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             const uint32_t S_v = dst->src[2]->ne[0];
             const uint32_t kda = (dst->src[3]->ne[0] == (int64_t)S_v) ? 1 : 0;
+            const uint32_t rep = dst->src[6] != nullptr ? 1 : 0;
             uint32_t si;
             switch (S_v) {
                 case 16:  si = 0; break;
@@ -8953,7 +8957,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 case 128: si = 3; break;
                 default: return nullptr;
             }
-            return ctx->device->pipeline_gated_delta_net[si][kda];
+            return ctx->device->pipeline_gated_delta_net[si][kda][rep];
         }
         return nullptr;
     case GGML_OP_SSM_SCAN:
@@ -10033,10 +10037,16 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
-    vk_subbuffer src_buf[6] = {};
-    for (int i = 0; i < 6; i++) {
-        src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+    vk_subbuffer src_buf[10] = {};
+    for (int i = 0; i < 10; i++) {
+        // the replay sources 6..9 bind q when the op has no replay
+        src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i] ? dst->src[i] : src_q);
     }
+
+    // replay of pending tokens, see ggml_gated_delta_net_ext
+    const ggml_tensor * src_pk  = dst->src[6];
+    const ggml_tensor * src_pv  = dst->src[7];
+    const ggml_tensor * src_pgb = dst->src[8];
 
     const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
     const uint32_t sq2 = (uint32_t)(src_q->nb[2] / sizeof(float));
@@ -10059,11 +10069,23 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
-        K
+        K,
+        src_pk  ? (uint32_t)ggml_get_op_params_i32(dst, 1) : 0u,
+        src_pk  ? (uint32_t)ggml_get_op_params_i32(dst, 2) : 0u,
+        src_pk  ? (uint32_t)(src_pk->nb[1]  / sizeof(float)) : 0u,
+        src_pk  ? (uint32_t)(src_pk->nb[2]  / sizeof(float)) : 0u,
+        src_pk  ? (uint32_t)(src_pk->nb[3]  / sizeof(float)) : 0u,
+        src_pv  ? (uint32_t)(src_pv->nb[1]  / sizeof(float)) : 0u,
+        src_pv  ? (uint32_t)(src_pv->nb[2]  / sizeof(float)) : 0u,
+        src_pv  ? (uint32_t)(src_pv->nb[3]  / sizeof(float)) : 0u,
+        src_pgb ? (uint32_t)(src_pgb->nb[1] / sizeof(float)) : 0u,
+        src_pgb ? (uint32_t)(src_pgb->nb[2] / sizeof(float)) : 0u,
+        src_pgb ? (uint32_t)(src_pgb->nb[3] / sizeof(float)) : 0u,
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf,
+         src_buf[6], src_buf[7], src_buf[8], src_buf[9]},
         pc, { H, n_seqs, S_v });
 }
 
@@ -10325,9 +10347,10 @@ void ggml_vk_fill(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor
     const uint64_t n = ggml_nelements(dst);
     GGML_ASSERT(n > 0);
 
+    // dst can be a view at any offset: bind from the aligned offset below it, the shader skips KY elements
     vk_op_push_constants pc = {
         (uint32_t)n,
-        1,
+        get_misalign_bytes(ctx, dst) / (uint32_t)ggml_type_size(dst->type),
         ggml_get_op_params_f32(dst, 0),
         0.0f,
         0.0f, 0.0f,
@@ -10343,7 +10366,7 @@ void ggml_vk_fill(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor
     GGML_ASSERT(wg_y <= ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, false);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
 
     std::array<uint32_t, 3> elements = { wg_x * pipeline->wg_denoms[0], wg_y * pipeline->wg_denoms[1], 1 };
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { dst_buf }, pc, elements);

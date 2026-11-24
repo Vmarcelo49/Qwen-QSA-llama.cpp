@@ -405,14 +405,27 @@ ggml_tensor * llama_model_kimi_k3::graph::build_kda_layer(
     const auto   kv_head  = mctx_cur->get_head();
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
-    ggml_tensor * conv_state_all  = build_rs(inp_rs, conv_states_all, hparams.n_embd_r(), n_seqs);
+    ggml_tensor * conv_state_all  = build_rs(inp_rs, conv_states_all, conv_states_all->ne[0], n_seqs);
 
     const int64_t mem_size = mctx_cur->get_size();
     const int64_t K_rs     = (int64_t) cparams.n_rs_seq + 1;
 
-    ggml_tensor * Qcur = kimi_k3_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
-    ggml_tensor * Kcur = kimi_k3_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
-    ggml_tensor * Vcur = kimi_k3_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
+    // rs_replay: the row holds the q, k and v conv histories one after the other
+    const auto conv1d = [&](int64_t qkv, ggml_tensor * proj_w, ggml_tensor * conv_w) {
+        if (!cparams.rs_replay) {
+            return kimi_k3_conv1d(gf, ctx0, conv_states_all, conv_state_all, qkv, cur, proj_w, conv_w, d_conv, head_dim, n_head_kda,
+                    n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
+        }
+        ggml_tensor * x_3d   = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, proj_w, cur), d_inner, n_seq_tokens, n_seqs);
+        ggml_tensor * conv_x = build_conv_state_replay(inp_rs, conv_states_all, x_3d, d_conv - 1, d_inner, il, conv_state_all, qkv);
+        ggml_tensor * Xcur   = ggml_ssm_conv(ctx0, conv_x, ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner));
+        Xcur = ggml_silu(ctx0, ggml_reshape_2d(ctx0, Xcur, d_inner, n_tokens));
+        return ggml_reshape_4d(ctx0, Xcur, head_dim, n_head_kda, n_seq_tokens, n_seqs);
+    };
+
+    ggml_tensor * Qcur = conv1d(0, layer.wq, layer.ssm_q_conv);
+    ggml_tensor * Kcur = conv1d(1, layer.wk, layer.ssm_k_conv);
+    ggml_tensor * Vcur = conv1d(2, layer.wv, layer.ssm_v_conv);
     cb(Qcur, "kda_q_conv", il);
     cb(Kcur, "kda_k_conv", il);
     cb(Vcur, "kda_v_conv", il);

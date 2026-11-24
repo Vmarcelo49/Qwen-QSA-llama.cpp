@@ -638,6 +638,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         if (!hparams.is_recr(il) || il < 0 || il == n_layer - 1 || il >= (int) a7_model.a7_attn.size()) {
             return "not a GDN layer / last layer";
         }
+        if (cparams.rs_replay) {
+            return "rs_replay (the op reads K = 4 state slots)";
+        }
         if (cparams.n_rs_seq != 3) {
             return "n_rs_seq != 3 (K = 4 state slots)";
         }
@@ -2575,6 +2578,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         int64_t              state_cols,
         int64_t              channels,
         int                  il) {
+    if (cparams.rs_replay) {
+        return build_conv_state_replay(inp, conv_states_all, x, state_cols, channels, il);
+    }
+
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head = mctx_cur->get_head();
