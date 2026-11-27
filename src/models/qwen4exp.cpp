@@ -1993,7 +1993,7 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
                 // a reserve graph has no ubatch: stream 0 stands for any
                 const uint32_t strm = mctx_cur->has_ubatch() ? mctx_cur->ubatch_stream() : 0;
                 // the backend makes the selected cold blocks resident and rewrites the ids to physical blocks before
-                // it attends (ggml-vulkan: ggml_vk_qsa_block_attn). op_params: [7] 1, [8..9] / [10..11] the host K / V
+                // it attends (ggml-vulkan: ggml_vk_qsa_block_attn, ggml-cuda: ggml_cuda_qsa_attn). op_params: [7] 1, [8..9] / [10..11] the host K / V
                 // pointers, [12] prefix cells, [13] ring cells, [14] cache slots, [15] cold blocks
                 if (!kv_stream_prm) {
                     auto sin = std::make_unique<llm_graph_input_kv_stream>(kv_stream, strm);
