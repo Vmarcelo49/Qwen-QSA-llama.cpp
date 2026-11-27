@@ -95,10 +95,12 @@ jobs:
           apt-get install -y --no-install-recommends build-essential cmake ninja-build libssl-dev
 
       - name: Build
-        # no CMAKE_CUDA_ARCHITECTURES: the broad default set from ggml/src/ggml-cuda/CMakeLists.txt
+        # the default set of ggml/src/ggml-cuda/CMakeLists.txt for CUDA 12.8 without 50-virtual (Maxwell):
+        # a7-gdn.cu uses __dp4a, which needs compute capability 6.1
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            "-DCMAKE_CUDA_ARCHITECTURES=61-virtual;70-virtual;75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real" \
             -DCMAKE_INSTALL_RPATH='$ORIGIN' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DGGML_BACKEND_DL=ON \
