@@ -96,13 +96,17 @@ void resolve() {
     memoryBarrierBuffer();
 
     // 2. one victim per miss: a clock sweep from the hand. A slot this call uses is never taken; a referenced one
-    //    loses its bit as the hand passes and can be taken on a later pass.
+    //    loses its bit as the hand passes and can be taken on a later pass. The exit test is read by every invocation
+    //    between two barriers, so no invocation's atomicAdd of this pass can make the waves disagree on it (they would
+    //    leave the loop on different passes and meet at different barriers).
     const int need = min(s_nmiss, int(S));
     uint scanned = 0;
     while (true) {
         barrier();
         memoryBarrierBuffer();
-        if (s_got >= need || scanned >= 3u * S) {
+        const bool done = s_got >= need || scanned >= 3u * S;
+        barrier();
+        if (done) {
             break;
         }
         if (tid < S) {
